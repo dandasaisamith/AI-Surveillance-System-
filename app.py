@@ -1,7 +1,12 @@
 import time
 from collections import deque, Counter, defaultdict
 from pathlib import Path
-import cv2
+import os
+import tempfile
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 import torch
 import numpy as np
 import streamlit as st
@@ -174,17 +179,48 @@ def main():
 
     with st.sidebar:
         st.header("Controls")
+        st.info("Live camera works locally. Cloud version supports upload/demo mode.")
+        
+        is_cloud = os.environ.get("STREAMLIT_SHARING_MODE") is not None or "STREAMLIT_SERVER_ADDRESS" in os.environ
+        uploaded_file = st.file_uploader("Upload Image/Video", type=["jpg", "jpeg", "png", "mp4"])
         
         if st.button("Start Stream"):
-            if st.session_state.cap is None:
-                new_cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-                if not new_cap.isOpened():
-                    new_cap = cv2.VideoCapture(0, cv2.CAP_MSMF)
-                if not new_cap.isOpened():
-                    st.error("Camera cannot be opened. Close other apps using camera.")
+            if st.session_state.cap is None and cv2 is not None:
+                new_cap = None
+                
+                if uploaded_file is not None:
+                    tfile = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1])
+                    tfile.write(uploaded_file.read())
+                    tfile.flush()
+                    new_cap = cv2.VideoCapture(tfile.name)
+                elif not is_cloud:
+                    if os.name == 'nt':
+                        new_cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+                        if not new_cap.isOpened():
+                            new_cap = cv2.VideoCapture(0, cv2.CAP_MSMF)
+                    else:
+                        new_cap = cv2.VideoCapture(0)
+                        
+                if new_cap is None or not new_cap.isOpened():
+                    st.warning("Camera not available or Cloud deployment detected. Switching to demo mode.")
+                    args.demo_mode = True
+                    core["demo_manager"].enabled = True
+                    
+                    fallback_path = "fallback_demo.jpg"
+                    if not os.path.exists(fallback_path):
+                        test_img = np.zeros((480, 640, 3), dtype=np.uint8)
+                        cv2.putText(test_img, "Demo Mode: Upload a file to test", (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                        cv2.imwrite(fallback_path, test_img)
+                    new_cap = cv2.VideoCapture(fallback_path)
+                    
+                if new_cap is not None and new_cap.isOpened():
+                    st.session_state.cap = new_cap
+                    st.session_state.running = True
+                else:
+                    st.error("Failed to initialize any media source.")
                     st.stop()
-                st.session_state.cap = new_cap
-                st.session_state.running = True
+            elif cv2 is None:
+                st.error("OpenCV is missing. Please ensure opencv-python-headless is installed.")
 
         if st.button("Stop Stream"):
             st.session_state.running = False
@@ -192,7 +228,7 @@ def main():
                 st.session_state.cap.release()
                 st.session_state.cap = None
 
-        st.write("Camera status:", "Opened" if (st.session_state.cap and st.session_state.cap.isOpened()) else "Not initialized")
+        st.write("Camera status:", "Opened" if (st.session_state.cap and st.session_state.cap.isOpened()) else ("Not initialized" if cv2 is not None else "cv2 missing"))
                 
         st.markdown("---")
         
@@ -300,9 +336,13 @@ def main():
         core["frame_index"] += 1
         ret, frame = cap.read()
         if not ret:
-            st.error("Failed to read frame")
-            st.session_state.running = False
-            break
+            if cv2 is not None:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = cap.read()
+            if not ret:
+                st.error("Failed to read frame from media.")
+                st.session_state.running = False
+                break
 
         annotated_frame = frame.copy()
         now = time.time()

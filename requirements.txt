@@ -1,0 +1,11 @@
+streamlit
+torch
+torchvision
+ultralytics
+opencv-python-headless
+pandas
+numpy
+deep-sort-realtime
+deepface
+SpeechRecognition
+pyttsx3
