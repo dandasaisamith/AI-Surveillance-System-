@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual Environment
+.venv/
+
+# Model files (IMPORTANT)
+*.pt
+*.h5
+
+# AI model folders
+.deepface/
+ultralytics/
+ai-survilliance-system/
+
+# Logs (keep structure only)
+data_logs/*
+!data_logs/.gitkeep
+
+suspicious_logs/*
+!suspicious_logs/.gitkeep
+
+# Runtime / outputs
+runs/
+.yolo/
+
+# IDE / OS
+.vscode/
+.DS_Store
