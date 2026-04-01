@@ -1,30 +1,35 @@
-# Python
+# Python cache
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
-# Virtual Environment
+# Virtual environments
 .venv/
+env/
 
-# Model files (IMPORTANT)
+# Model files (heavy)
 *.pt
 *.h5
+*.onnx
 
-# AI model folders
-.deepface/
+# AI libraries / local clones
+deepface/
 ultralytics/
-ai-survilliance-system/
 
-# Logs (keep structure only)
+# Runtime outputs
+runs/
+.yolo/
+
+# Logs (keep folders, ignore content)
 data_logs/*
 !data_logs/.gitkeep
 
 suspicious_logs/*
 !suspicious_logs/.gitkeep
 
-# Runtime / outputs
-runs/
-.yolo/
-
-# IDE / OS
-.vscode/
+# OS files
 .DS_Store
+
+# IDE
+.vscode/

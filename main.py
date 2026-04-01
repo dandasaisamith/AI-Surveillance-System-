@@ -30,12 +30,24 @@ try:
 except ImportError:
     sr = None
 
-DEEPFACE_IMPORT_ERROR = None
+# DEEPFACE SAFE INITIALIZATION WITH GPU SUPPORT
 try:
     from deepface import DeepFace
-except Exception as exc:
+    import tensorflow as tf
+    
+    tf.config.optimizer.set_jit(True)
+    
+    gpus = tf.config.list_physical_devices('GPU')
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+    
+    DEEPFACE_AVAILABLE = True
+    DEEPFACE_IMPORT_ERROR = None
+except Exception as e:
+    print("DeepFace failed:", e)
     DeepFace = None
-    DEEPFACE_IMPORT_ERROR = str(exc)
+    DEEPFACE_AVAILABLE = False
+    DEEPFACE_IMPORT_ERROR = str(e)
 
 # Prefer the vendored Ultralytics checkout in this repository over any top-level
 # namespace package with the same name.
@@ -553,6 +565,43 @@ class LineCounter:
         self.total_crossings = 0
         self.class_counts = Counter()
 
+
+class CrowdMonitor:
+    """Monitor crowd density and trigger overcrowding alerts."""
+    
+    def __init__(self, threshold: int = 5, cooldown_seconds: float = 30.0):
+        self.threshold = threshold
+        self.cooldown_seconds = cooldown_seconds
+        self.last_alert_time = 0.0
+        self.crowd_history: deque = deque(maxlen=100)
+    
+    def update(self, person_count: int, now: float) -> None:
+        """Update crowd history."""
+        self.crowd_history.append((now, person_count))
+    
+    def check_overcrowding(self, person_count: int, now: float, frame, alert_manager) -> bool:
+        """Check for overcrowding and trigger alert."""
+        if person_count <= self.threshold:
+            return False
+        
+        if (now - self.last_alert_time) < self.cooldown_seconds:
+            return False
+        
+        reason = f"Overcrowding detected: {person_count} persons (threshold: {self.threshold})"
+        if alert_manager.trigger(frame, reason, trigger_key="overcrowding", cooldown_seconds=self.cooldown_seconds):
+            self.last_alert_time = now
+            alert_manager.log_alert(-1, reason, now, frame, {"person_age": "N/A", "person_emotion": "N/A", "person_gender": "N/A"})
+            return True
+        return False
+    
+    def get_status(self, person_count: int) -> str:
+        """Get crowd status."""
+        if person_count > self.threshold:
+            return "CROWDED"
+        elif person_count > self.threshold * 0.7:
+            return "MODERATE"
+        return "NORMAL"
+
     def line_value(self, frame_shape) -> int:
         height, width = frame_shape[:2]
         if self.axis == "horizontal":
@@ -673,7 +722,10 @@ class SuspiciousBehaviorDetector:
                 np.hypot(sample_center[0] - reference[0], sample_center[1] - reference[1])
                 for _, sample_center in samples
             )
-            is_suspicious = max_distance <= self.movement_threshold
+            
+            # FIXED LOGIC: Only mark suspicious if idle AND minimal movement
+            is_suspicious = (dwell_time > self.idle_seconds) and (max_distance < self.movement_threshold)
+            
             track_analysis[track_id] = {
                 "track_id": track_id,
                 "dwell_time": dwell_time,
@@ -844,25 +896,39 @@ class PersonIntelligenceManager:
     def __init__(
         self,
         person_class_id: int | None,
-        analyze_every_frames: int = 12,
+        analyze_every_frames: int = 10,
         stale_seconds: float = 1.5,
         analyze_cooldown_seconds: float = 10.0,
     ):
         self.person_class_id = person_class_id
-        self.analyze_every_frames = max(10, analyze_every_frames)
+        self.analyze_every_frames = analyze_every_frames
         self.stale_seconds = stale_seconds
         self.analyze_cooldown_seconds = analyze_cooldown_seconds
-        self.enabled = DeepFace is not None and person_class_id is not None
+        self.enabled = True if (person_class_id is not None and DEEPFACE_AVAILABLE) else False
         self.records: dict[int, dict] = {}
+        self.deepface_cache = {}
         self.lock = threading.Lock()
         self.pending_track_ids: set[int] = set()
         self.job_queue: queue.Queue[dict] = queue.Queue(maxsize=12)
         self.stop_event = threading.Event()
         self.worker = None
+        self.frame_counter = 0
 
-        if self.enabled:
-            self.worker = threading.Thread(target=self._run, name="person-intelligence", daemon=True)
-            self.worker.start()
+        if self.enabled and DEEPFACE_AVAILABLE:
+            try:
+                # WARMUP DEEPFACE MODELS ONCE AT STARTUP
+                print("Warming up DeepFace models...")
+                DeepFace.analyze(
+                    img_path=np.zeros((224, 224, 3), dtype=np.uint8),
+                    actions=['age', 'gender', 'emotion'],
+                    enforce_detection=False
+                )
+                print("DeepFace models ready")
+                self.worker = threading.Thread(target=self._run, name="person-intelligence", daemon=True)
+                self.worker.start()
+            except Exception as e:
+                self.enabled = False
+                print(f"DeepFace initialization failed: {e}")
 
     def _run(self) -> None:
         while not self.stop_event.is_set():
@@ -873,7 +939,7 @@ class PersonIntelligenceManager:
 
             track_id = job["track_id"]
             try:
-                result = self._analyze_crop(job["crop"])
+                result = self._analyze_crop(job["crop"], track_id)
                 if result is None:
                     with self.lock:
                         record = self.records.get(track_id)
@@ -898,51 +964,54 @@ class PersonIntelligenceManager:
                         record["analysis_error"] = str(exc)
                         record["last_analyzed_epoch"] = job["now"]
                         if not record.get("analysis_ready"):
-                            record["age"] = "Pending"
-                            record["gender"] = "Pending"
-                            record["emotion"] = "Pending"
+                            record["age"] = "Unavailable"
+                            record["gender"] = "Unavailable"
+                            record["emotion"] = "Unavailable"
             finally:
                 with self.lock:
                     self.pending_track_ids.discard(track_id)
 
-    def _analyze_crop(self, crop) -> dict | None:
-        if DeepFace is None or crop is None or crop.size == 0:
+    def _analyze_crop(self, crop, track_id=None) -> dict | None:
+        if not DEEPFACE_AVAILABLE or crop is None or crop.size == 0:
             return None
 
-        height, width = crop.shape[:2]
-        if height < 24 or width < 24:
-            return None
+        if track_id is not None and track_id in self.deepface_cache:
+            return self.deepface_cache[track_id]
 
-        max_side = max(height, width)
-        if max_side > 224:
-            scale = 224.0 / max_side
-            crop = cv2.resize(crop, (max(24, int(width * scale)), max(24, int(height * scale))))
+        try:
+            result = DeepFace.analyze(
+                img_path=crop,
+                actions=['age', 'gender', 'emotion'],
+                enforce_detection=False,
+                detector_backend='opencv',
+                silent=True
+            )
+            
+            if isinstance(result, list):
+                result = result[0] if result else {}
+                
+            age = result.get("age")
+            dominant_gender = result.get("dominant_gender")
+            if dominant_gender is None and isinstance(result.get("gender"), dict):
+                dominant_gender = max(result["gender"], key=result["gender"].get)
+            dominant_emotion = result.get("dominant_emotion")
+            if dominant_emotion is None and isinstance(result.get("emotion"), dict):
+                dominant_emotion = max(result["emotion"], key=result["emotion"].get)
 
-        analysis = DeepFace.analyze(
-            img_path=crop,
-            actions=("age", "gender", "emotion"),
-            enforce_detection=True,
-            detector_backend="opencv",
-            silent=True,
-        )
-        if isinstance(analysis, list):
-            analysis = analysis[0] if analysis else {}
-        if not isinstance(analysis, dict):
-            return None
-
-        age = analysis.get("age")
-        dominant_gender = analysis.get("dominant_gender")
-        if dominant_gender is None and isinstance(analysis.get("gender"), dict):
-            dominant_gender = max(analysis["gender"], key=analysis["gender"].get)
-        dominant_emotion = analysis.get("dominant_emotion")
-        if dominant_emotion is None and isinstance(analysis.get("emotion"), dict):
-            dominant_emotion = max(analysis["emotion"], key=analysis["emotion"].get)
-
-        return {
-            "age": None if age is None else int(round(float(age))),
-            "gender": dominant_gender or "Unknown",
-            "emotion": dominant_emotion or "neutral",
-        }
+            output = {
+                "age": int(round(float(age))) if age is not None else "N/A",
+                "gender": dominant_gender if dominant_gender else "N/A",
+                "emotion": dominant_emotion if dominant_emotion else "N/A",
+            }
+            if track_id is not None:
+                self.deepface_cache[track_id] = output
+            return output
+        except Exception as e:
+            return {
+                "age": "N/A",
+                "gender": "N/A",
+                "emotion": "N/A",
+            }
 
     def _ensure_record(self, track: dict, now: float) -> dict:
         track_id = track["track_id"]
@@ -993,6 +1062,8 @@ class PersonIntelligenceManager:
     def update(self, active_tracks: list[dict], frame, now: float, frame_index: int) -> dict:
         timestamp = datetime.fromtimestamp(now).strftime("%H:%M:%S")
         active_ids = set()
+        self.frame_counter += 1
+        should_analyze_this_frame = (self.frame_counter % self.analyze_every_frames) == 0
 
         with self.lock:
             for track in active_tracks:
@@ -1011,16 +1082,16 @@ class PersonIntelligenceManager:
                 time_since_last_analyze = now - float(record.get("last_analyzed_epoch", 0.0))
                 should_analyze = (
                     self.enabled
-                    and track.get("hits", 0) >= 5
-                    and track.get("area", 0) >= 2500
-                    and time_since_last_analyze >= 8.0
+                    and should_analyze_this_frame
+                    and track.get("hits", 0) >= 3
+                    and time_since_last_analyze >= self.analyze_cooldown_seconds
                 )
                 if should_analyze:
                     x1, y1, x2, y2 = track["box"]
                     pad_x = max(8, int((x2 - x1) * 0.08))
                     pad_y = max(8, int((y2 - y1) * 0.08))
                     crop = frame[max(0, y1 - pad_y):min(frame.shape[0], y2 + pad_y), max(0, x1 - pad_x):min(frame.shape[1], x2 + pad_x)]
-                    if self._queue_analysis(track_id, crop, frame_index, now):
+                    if crop.size > 0 and self._queue_analysis(track_id, crop, frame_index, now):
                         record["last_analyzed_frame"] = frame_index
                         record["last_analyzed_epoch"] = now
                         record["analysis_attempts"] = int(record.get("analysis_attempts", 0)) + 1
@@ -1041,11 +1112,27 @@ class PersonIntelligenceManager:
             self.records.values(),
             key=lambda item: (not item.get("active", False), -float(item.get("total_duration", 0.0)), item.get("track_id", 0)),
         )
+        # Return structure with track_id as key
+        structured_records = {}
+        for record in ordered:
+            track_id = record.get("track_id")
+            if track_id is not None:
+                structured_records[track_id] = {
+                    "age": record.get("age", "N/A"),
+                    "gender": record.get("gender", "N/A"),
+                    "emotion": record.get("emotion", "N/A"),
+                    "entry_time": record.get("entry_time", record.get("first_seen", "N/A")),
+                    "last_seen": record.get("last_seen", "N/A"),
+                    "total_duration": record.get("total_duration", 0.0),
+                    "active": record.get("active", False),
+                    "movement_state": record.get("movement_state", "moving"),
+                }
         return {
             "enabled": self.enabled,
-            "available": DeepFace is not None,
+            "available": DEEPFACE_AVAILABLE,
             "error": DEEPFACE_IMPORT_ERROR,
             "records": [dict(item) for item in ordered],
+            "structured": structured_records,
         }
 
     def snapshot(self) -> dict:
@@ -1081,6 +1168,136 @@ class AlertManager:
         self.banner_until = 0.0
         self.last_message = ""
         self.last_trigger_at: dict[str, float] = {}
+        self.track_alert_history: dict[int, dict[str, float]] = defaultdict(dict)
+        self.alert_log: list[dict] = []
+        self.loitering_threshold = 20.0
+        self.age_threshold = 10
+
+    def can_trigger_for_track(self, track_id: int, alert_type: str, now: float, cooldown: float = 20.0) -> bool:
+        """Check if alert can be triggered for specific track_id and alert type."""
+        last_alert_time = self.track_alert_history[track_id].get(alert_type, 0.0)
+        return (now - last_alert_time) >= cooldown
+    
+    def record_track_alert(self, track_id: int, alert_type: str, now: float) -> None:
+        """Record alert for specific track_id to prevent duplicates."""
+        self.track_alert_history[track_id][alert_type] = now
+    
+    def log_alert(self, track_id: int, reason: str, timestamp: float, frame, track_data: dict = None) -> None:
+        """Store alert with track_id, reason, timestamp, frame, and person data."""
+        # Convert BGR to RGB for proper display
+        snapshot = frame.copy() if frame is not None else None
+        if snapshot is not None:
+            snapshot = cv2.cvtColor(snapshot, cv2.COLOR_BGR2RGB)
+        
+        alert_entry = {
+            "track_id": track_id,
+            "reason": reason,
+            "timestamp": timestamp,
+            "frame": snapshot,
+            "datetime": datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S"),
+            "age": track_data.get("person_age", "N/A") if track_data else "N/A",
+            "emotion": track_data.get("person_emotion", "N/A") if track_data else "N/A",
+            "gender": track_data.get("person_gender", "N/A") if track_data else "N/A"
+        }
+        self.alert_log.append(alert_entry)
+        # Keep only last 100 alerts
+        if len(self.alert_log) > 100:
+            self.alert_log = self.alert_log[-100:]
+    
+    def get_alerts(self, limit: int = 50) -> list[dict]:
+        """Get recent alerts."""
+        return self.alert_log[-limit:] if self.alert_log else []
+
+    def check_loitering(self, track: dict, now: float, frame) -> bool:
+        """Check for loitering (>20 seconds idle)."""
+        track_id = track["track_id"]
+        duration = track.get("dwell_time", 0.0)
+        
+        if duration > self.loitering_threshold:
+            if self.can_trigger_for_track(track_id, "loitering", now):
+                reason = f"Loitering detected: {duration:.1f}s idle"
+                if self.trigger(frame, reason, trigger_key=f"loitering-{track_id}", cooldown_seconds=20.0):
+                    self.record_track_alert(track_id, "loitering", now)
+                    self.log_alert(track_id, reason, now, frame, track)
+                    return True
+        return False
+    
+    def check_restricted_zone(self, track: dict, zone_rect: tuple, now: float, frame) -> bool:
+        """Check for restricted zone entry."""
+        if zone_rect is None:
+            return False
+        
+        track_id = track["track_id"]
+        cx, cy = track["center"]
+        x1, y1, x2, y2 = zone_rect
+        
+        if x1 <= cx <= x2 and y1 <= cy <= y2:
+            if self.can_trigger_for_track(track_id, "zone_breach", now):
+                reason = f"Restricted zone breach detected"
+                if self.trigger(frame, reason, trigger_key=f"zone-{track_id}", cooldown_seconds=20.0):
+                    self.record_track_alert(track_id, "zone_breach", now)
+                    self.log_alert(track_id, reason, now, frame, track)
+                    return True
+        return False
+    
+    def check_age_alert(self, track: dict, now: float, frame) -> bool:
+        """Check for age < 10 detection."""
+        track_id = track["track_id"]
+        age = track.get("person_age")
+        
+        if age is not None and age != "N/A" and age != "Analyzing":
+            try:
+                age_value = int(age) if isinstance(age, (int, float, str)) else None
+                if age_value is not None and age_value < self.age_threshold:
+                    if self.can_trigger_for_track(track_id, "age_alert", now):
+                        reason = f"Child detected: Age {age_value}"
+                        if self.trigger(frame, reason, trigger_key=f"age-{track_id}", cooldown_seconds=20.0):
+                            self.record_track_alert(track_id, "age_alert", now)
+                            self.log_alert(track_id, reason, now, frame, track)
+                            return True
+            except (ValueError, TypeError):
+                pass
+        return False
+    
+    def check_sudden_movement(self, track: dict, now: float, frame) -> bool:
+        """Check for sudden movement anomaly."""
+        track_id = track["track_id"]
+        speed = track.get("movement_speed", 0.0)
+        
+        # Sudden movement threshold: speed > 50 pixels/second
+        if speed > 50.0:
+            if self.can_trigger_for_track(track_id, "sudden_movement", now):
+                reason = f"Sudden movement detected: {speed:.1f} px/s"
+                if self.trigger(frame, reason, trigger_key=f"movement-{track_id}", cooldown_seconds=20.0):
+                    self.record_track_alert(track_id, "sudden_movement", now)
+                    self.log_alert(track_id, reason, now, frame, track)
+                    return True
+        return False
+    
+    def evaluate_track_alerts(self, active_tracks: list[dict], zone_rect: tuple, now: float, frame, enabled: bool) -> list[dict]:
+        """Evaluate all alert conditions for active tracks."""
+        if not enabled:
+            return []
+        
+        triggered_alerts = []
+        for track in active_tracks:
+            # Check loitering
+            if self.check_loitering(track, now, frame):
+                triggered_alerts.append({"track_id": track["track_id"], "type": "loitering"})
+            
+            # Check restricted zone
+            if self.check_restricted_zone(track, zone_rect, now, frame):
+                triggered_alerts.append({"track_id": track["track_id"], "type": "zone_breach"})
+            
+            # Check age alert
+            if self.check_age_alert(track, now, frame):
+                triggered_alerts.append({"track_id": track["track_id"], "type": "age_alert"})
+            
+            # Check sudden movement
+            if self.check_sudden_movement(track, now, frame):
+                triggered_alerts.append({"track_id": track["track_id"], "type": "sudden_movement"})
+        
+        return triggered_alerts
 
     def trigger(
         self,
@@ -1432,6 +1649,7 @@ def build_system_state(
     logs: list[dict],
     status: dict | None = None,
     person_intelligence: dict | None = None,
+    alert_insights: list[dict] | None = None,
 ):
     normalized_tracks = []
     for track in tracks:
@@ -1465,11 +1683,27 @@ def build_system_state(
         "logs": logs,
         "status": status or {},
         "person_intelligence": normalized_people,
+        "alert_insights": alert_insights or [],
     }
 
 
 def get_system_state() -> dict:
     return LAST_SYSTEM_STATE.copy()
+
+
+def get_alert_insights() -> list[dict]:
+    """Get alert insights for UI display."""
+    return LAST_SYSTEM_STATE.get("alert_insights", [])
+
+
+def get_detections() -> list[str]:
+    """Get current detections for UI display."""
+    return LAST_SYSTEM_STATE.get("detections", [])
+
+
+def get_person_data() -> dict:
+    """Get person intelligence data for UI display."""
+    return LAST_SYSTEM_STATE.get("person_data", {})
 
 
 def build_dashboard_analytics(analytics_store: dict, counter: LineCounter, system_state: dict) -> dict:
@@ -2349,6 +2583,7 @@ def main():
         position_ratio=args.count_position,
         direction=args.count_direction,
     )
+    crowd_monitor = CrowdMonitor(threshold=5, cooldown_seconds=30.0)
     suspicious_detector = SuspiciousBehaviorDetector(
         person_class_id=person_class_id,
         idle_seconds=effective_idle_seconds,
@@ -2438,6 +2673,15 @@ def main():
                         half=runtime["use_half"],
                     )
                 detection_summaries = extract_detection_summary(results[0], names)
+                
+                # Extract ALL detection labels for UI (no filtering)
+                detection_labels = []
+                if results[0].boxes:
+                    for box in results[0].boxes:
+                        cls_id = int(box.cls[0])
+                        label = get_class_name(names, cls_id)
+                        detection_labels.append(label)
+                
                 detections = build_detections(results[0])
                 tracks = tracker.update_tracks(detections, frame=frame)
                 active_tracks, active_counts = render_tracks(
@@ -2489,6 +2733,14 @@ def main():
                     track["movement_state"] = record.get("movement_state", "moving")
                     track["person_duration"] = record.get("total_duration", 0.0)
 
+                # Count persons (class_id 0 for person)
+                person_count = sum(1 for track in active_tracks if track.get("class_id") == 0)
+                crowd_monitor.update(person_count, now)
+                
+                # Check overcrowding
+                if alerts_enabled:
+                    crowd_monitor.check_overcrowding(person_count, now, video_frame, alert_manager)
+
                 primary_target = prioritize_target(active_tracks, {**track_analysis, **intent_analysis})
                 highlight_special_tracks(
                     video_frame,
@@ -2498,6 +2750,16 @@ def main():
                 )
 
                 if alerts_enabled:
+                    # Use new alert evaluation system
+                    triggered_alerts = alert_manager.evaluate_track_alerts(
+                        active_tracks,
+                        intent_predictor.restricted_zone(frame.shape),
+                        now,
+                        video_frame,
+                        True
+                    )
+                    
+                    # Legacy suspicious behavior alerts
                     for track in new_suspicious_tracks[:2]:
                         reasoning = build_suspicious_reasoning(track, track_analysis.get(track["track_id"], {}))
                         if alert_manager.trigger(
@@ -2647,10 +2909,15 @@ def main():
                     "unique_total": counter.unique_total,
                     "class_unique_counts": dict(counter.class_counts),
                     "class_active_counts": dict(counter.active_class_counts),
+                    "crowd_status": crowd_monitor.get_status(sum(1 for t in active_tracks if t.get("class_id") == 0)),
+                    "crowd_count": sum(1 for t in active_tracks if t.get("class_id") == 0),
                 },
                 person_intelligence=person_intelligence_state,
+                alert_insights=alert_manager.get_alerts(limit=20),
             )
             LAST_SYSTEM_STATE = system_state
+            LAST_SYSTEM_STATE["detections"] = detection_labels if 'detection_labels' in locals() else []
+            LAST_SYSTEM_STATE["person_data"] = person_intelligence_state.get("structured", {})
             analytics_view = build_dashboard_analytics(analytics_store, counter, system_state)
             dashboard = render_dashboard(
                 video_frame,

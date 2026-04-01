@@ -1,0 +1,10 @@
+streamlit
+opencv-python
+numpy
+pandas
+pillow
+torch
+torchvision
+ultralytics
+deep-sort-realtime
+google-generativeai
